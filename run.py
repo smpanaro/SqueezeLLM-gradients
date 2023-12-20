@@ -178,62 +178,96 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, dat
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
+def is_llama(model_name):
+    return "meta-llama/Llama-2" in model_name
 
-def get_modules(layer):
+def is_gpt2(model_name):
+    return model_name in ["gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"]
+
+def get_modules(model_name, layer):
     # NOTE: This is llama-specific
     # For other models, replace this with proper names for all linear layers
-    return[
-        layer.self_attn.q_proj,
-        layer.self_attn.k_proj,
-        layer.self_attn.v_proj,
-        layer.self_attn.o_proj,
-        layer.mlp.gate_proj,
-        layer.mlp.up_proj,
-        layer.mlp.down_proj,
-    ]
+    if is_llama(model_name):
+        return[
+            layer.self_attn.q_proj,
+            layer.self_attn.k_proj,
+            layer.self_attn.v_proj,
+            layer.self_attn.o_proj,
+            layer.mlp.gate_proj,
+            layer.mlp.up_proj,
+            layer.mlp.down_proj,
+        ]
+    elif is_gpt2(model_name):
+        return [
+            layer.attn.c_attn,
+            layer.attn.c_proj,
+            layer.mlp.c_fc,
+            layer.mlp.c_proj,
+        ]
+    else:
+        raise NotImplementedError(f"model {model_name} not supported")
 
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    # seqlen = 32 # short for testing
+    seqlen = 512 # long for calibration
+
     if data_args.dataset == "c4":
         from datautils import get_loaders
         print("Calibration with C4 ")
-        dataloader, testloader = get_loaders(data_args.dataset,  model=model_args.model_name_or_path, seqlen=512)
+        dataloader, testloader = get_loaders(data_args.dataset,  model=model_args.model_name_or_path, seqlen=seqlen)
     else:
         raise NotImplementedError("Please define your own dataset here")
 
+    model_name = model_args.model_name_or_path
+    device = torch.device("cuda")
+
     model = transformers.AutoModelForCausalLM.from_pretrained(
-        model_args.model_name_or_path,
+        model_name,
         cache_dir=training_args.cache_dir,
         trust_remote_code=True,
     )
-    model = model.bfloat16()
-    try:
-        model.lm_head.cuda()
-    except:
-        pass
+    if device == torch.device("mps"):
+        model = model.half()
+    else:
+        model = model.bfloat16()
+        try:
+            model.lm_head.cuda()
+        except:
+            pass
 
     # NOTE: this is llama-specific
     # For other models, replace this with proper variable names for model and layers
-    _model = model.model
-    _layers = _model.layers
-    _model.set_devices()
+    if is_llama(model_name):
+        _model = model.model
+        _layers = _model.layers
+        _model.set_devices() # what is this
+        _num_linear_per_layer = _model.num_linear_layers
+    elif is_gpt2(model_name):
+        _model = model.transformer
+        _layers = _model.h
+        # _model.set_devices()
+        _num_linear_per_layer = 4 # c_attn, c_proj, c_fc, c_proj (in gpt these are conv1d....)
+
+    model = torch.compile(model)
+    model = model.to(device)
 
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    
-    grads = [[0.] * _model.num_linear_layers for _ in _layers]
+
+    grads = [[0.] * _num_linear_per_layer for _ in _layers]
 
     for i, data in tqdm(enumerate(dataloader[:data_args.num_examples])):
         data = data[0]
-        x = data.cuda()
+        x = data.to(device)
         outputs = model(input_ids=x, labels=x)
         loss = outputs.loss
         loss.backward()
 
         for i, layer in enumerate(_layers):
-            for j, module in enumerate(get_modules(layer)):
+            for j, module in enumerate(get_modules(model_name, layer)):
                 grad = module.weight.grad
                 grads[i][j] += (grad ** 2).float().cpu()
 
@@ -243,7 +277,7 @@ def train():
     # where we overwrite all the weights in the model as the gradients
     # and use HF save_pretrained`
     for i, layer in enumerate(_layers):
-        for j, module in enumerate(get_modules(layer)):
+        for j, module in enumerate(get_modules(model_name, layer)):
             module.weight.data = grads[i][j]
 
     print(f"saving model gradient at {training_args.output_dir}")
